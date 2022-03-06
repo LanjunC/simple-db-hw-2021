@@ -1,5 +1,6 @@
 package simpledb.common;
 
+import com.sun.xml.internal.ws.api.model.CheckedException;
 import simpledb.common.Type;
 import simpledb.storage.DbFile;
 import simpledb.storage.HeapFile;
@@ -23,12 +24,30 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class Catalog {
 
+    private ConcurrentHashMap<Integer, Table> tablesOfIdKey; //以id为主键存储tables引用
+    private ConcurrentHashMap<String, Table> tablesOfNameKey; //以tableName为主键存储tables引用
+
+    private static class Table {
+        private final DbFile dbFile;
+        private final String tableName;
+        private final String primaryKey;
+
+        public Table(DbFile file, String name, String pkeyField) {
+            dbFile = file;
+            tableName = name;
+            primaryKey = pkeyField;
+        }
+        // todo: other methods
+    }
+
     /**
      * Constructor.
      * Creates a new, empty catalog.
      */
     public Catalog() {
         // some code goes here
+        tablesOfIdKey = new ConcurrentHashMap<>();
+        tablesOfNameKey = new ConcurrentHashMap<>();
     }
 
     /**
@@ -42,6 +61,15 @@ public class Catalog {
      */
     public void addTable(DbFile file, String name, String pkeyField) {
         // some code goes here
+        // todo: null as table name
+        Table table = new Table(file, name, pkeyField);
+        // conflict table name: 删除有重复名的table
+        Table hasOne = tablesOfNameKey.getOrDefault(name, null);
+        if (hasOne != null) {
+            tablesOfIdKey.remove(hasOne.dbFile.getId());
+        }
+        tablesOfNameKey.put(name, table);
+        tablesOfIdKey.put(file.getId(), table);
     }
 
     public void addTable(DbFile file, String name) {
@@ -65,7 +93,14 @@ public class Catalog {
      */
     public int getTableId(String name) throws NoSuchElementException {
         // some code goes here
-        return 0;
+        if (name == null) {
+            throw new NoSuchElementException("no table named " + null);
+        }
+        Table t = tablesOfNameKey.getOrDefault(name, null);
+        if (t != null) {
+            return t.dbFile.getId();
+        }
+        throw new NoSuchElementException("no table named " + name);
     }
 
     /**
@@ -76,7 +111,11 @@ public class Catalog {
      */
     public TupleDesc getTupleDesc(int tableid) throws NoSuchElementException {
         // some code goes here
-        return null;
+        Table t = tablesOfIdKey.getOrDefault(tableid, null);
+        if (t != null) {
+            return t.dbFile.getTupleDesc();
+        }
+        throw new NoSuchElementException("no table with tableid " + tableid);
     }
 
     /**
@@ -87,29 +126,43 @@ public class Catalog {
      */
     public DbFile getDatabaseFile(int tableid) throws NoSuchElementException {
         // some code goes here
-        return null;
+        Table t = tablesOfIdKey.getOrDefault(tableid, null);
+        if (t != null) {
+            return t.dbFile;
+        }
+        throw new NoSuchElementException("no table with tableid " + tableid);
     }
 
     public String getPrimaryKey(int tableid) {
         // some code goes here
-        return null;
+        Table t = tablesOfIdKey.getOrDefault(tableid, null);
+        if (t != null) {
+            return t.primaryKey;
+        }
+        throw new NoSuchElementException("no table with tableid " + tableid);
     }
 
     public Iterator<Integer> tableIdIterator() {
         // some code goes here
-        return null;
+        return tablesOfIdKey.keySet().iterator();
     }
 
     public String getTableName(int id) {
         // some code goes here
-        return null;
+        Table t = tablesOfIdKey.getOrDefault(id, null);
+        if (t != null) {
+            return t.tableName;
+        }
+        throw new NoSuchElementException("no table with tableid " + id);
     }
     
     /** Delete all tables from the catalog */
     public void clear() {
         // some code goes here
+        tablesOfIdKey.clear();
+        tablesOfNameKey.clear();
     }
-    
+    //todo: read it.
     /**
      * Reads the schema from a file and creates the appropriate tables in the database.
      * @param catalogFile
