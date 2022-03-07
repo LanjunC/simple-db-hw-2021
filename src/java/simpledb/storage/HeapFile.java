@@ -8,6 +8,7 @@ import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
 import java.io.*;
+import java.nio.Buffer;
 import java.util.*;
 
 /**
@@ -22,6 +23,13 @@ import java.util.*;
  */
 public class HeapFile implements DbFile {
 
+    private final File file;
+    private final TupleDesc tupleDesc;
+    //冗余信息. An ID uniquely identifying this HeapFile.
+    // Return the same value for a particular HeapFile.
+    // 实际上就是tableId。
+    private final int heapFileId;
+
     /**
      * Constructs a heap file backed by the specified file.
      * 
@@ -31,6 +39,9 @@ public class HeapFile implements DbFile {
      */
     public HeapFile(File f, TupleDesc td) {
         // some code goes here
+        file = f;
+        tupleDesc = td;
+        heapFileId = f.getAbsoluteFile().hashCode();
     }
 
     /**
@@ -40,7 +51,7 @@ public class HeapFile implements DbFile {
      */
     public File getFile() {
         // some code goes here
-        return null;
+        return file;
     }
 
     /**
@@ -54,7 +65,7 @@ public class HeapFile implements DbFile {
      */
     public int getId() {
         // some code goes here
-        throw new UnsupportedOperationException("implement this");
+        return heapFileId;
     }
 
     /**
@@ -64,12 +75,44 @@ public class HeapFile implements DbFile {
      */
     public TupleDesc getTupleDesc() {
         // some code goes here
-        throw new UnsupportedOperationException("implement this");
+        return tupleDesc;
     }
 
     // see DbFile.java for javadocs
+    // 该函数的意义：仅会被BufferPool调用，用于直接从disk取Page，而其他地方（外部）获取page只会通过BufferPool
+    // Reference from DbFile.java: DbFiles are generally accessed through the buffer pool,
+    // rather than directly by operators.
     public Page readPage(PageId pid) {
         // some code goes here
+        int tableId = pid.getTableId(); //tableId实际上就是
+        int pgNo = pid.getPageNumber();
+        int pgSize = BufferPool.getPageSize();
+        RandomAccessFile f = null;
+        try {
+            if (tableId != getId()) {
+                // 非法操作
+                throw new IllegalArgumentException("invalid tableId: pageId.tableId not equals headFileId");
+            }
+            f = new RandomAccessFile(file, "r"); // and open
+            if ((pgNo + 1) * pgSize > f.length()) {
+                throw new IllegalArgumentException(String.format("invalid pageNo %d of tableId %d", pgNo, tableId));
+            }
+            f.seek(pgNo * pgSize);
+            byte[] bytes = new byte[pgSize];
+            int read = f.read(bytes, 0, pgSize);
+            if (read != pgSize) {
+                throw new IllegalArgumentException(String.format("expected %d bytes but read %d", pgSize, read));
+            }
+            return new HeapPage(new HeapPageId(tableId, pgNo), bytes);
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                f.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
         return null;
     }
 
@@ -84,7 +127,8 @@ public class HeapFile implements DbFile {
      */
     public int numPages() {
         // some code goes here
-        return 0;
+        // Attention
+        return (int)(file.length() / BufferPool.getPageSize());
     }
 
     // see DbFile.java for javadocs
@@ -106,8 +150,67 @@ public class HeapFile implements DbFile {
     // see DbFile.java for javadocs
     public DbFileIterator iterator(TransactionId tid) {
         // some code goes here
-        return null;
+        return new HeapFileIterator(tid);
     }
 
+    private final class HeapFileIterator implements DbFileIterator {
+        private final TransactionId transactionId;
+        private Iterator<Tuple> it;
+        private int pageNo;
+
+        public HeapFileIterator(TransactionId tid) {
+            transactionId = tid;
+        }
+
+        private Iterator<Tuple> getPageIterator(int pgNo) throws DbException, TransactionAbortedException {
+            if (pgNo < 0 || pgNo >= numPages()) {
+                throw new DbException(String.format("invalid pageNo %d while traversing the tuples by iterator", pgNo));
+            }
+            PageId pid = new HeapPageId(getId(), pgNo);
+            HeapPage page = (HeapPage)Database.getBufferPool().getPage(transactionId, pid, Permissions.READ_ONLY);
+            return page.iterator();
+        }
+
+        @Override
+        public void open() throws DbException, TransactionAbortedException {
+            pageNo = 0;
+            it = getPageIterator(pageNo);
+        }
+
+        @Override
+        public boolean hasNext() throws DbException, TransactionAbortedException {
+            if (it == null) {
+                return false;
+            }
+            if (!it.hasNext()) {
+                if (pageNo < numPages() - 1) {
+                    pageNo++;
+                    it = getPageIterator(pageNo);
+                    return true;
+                }
+                return false;
+            }
+            return true;
+        }
+
+        @Override
+        public Tuple next() throws DbException, TransactionAbortedException, NoSuchElementException {
+            if (it == null || !it.hasNext()) {
+                throw new NoSuchElementException("invalid use of iterator");
+            }
+            return it.next();
+        }
+
+        @Override
+        public void rewind() throws DbException, TransactionAbortedException {
+            close();
+            open();
+        }
+
+        @Override
+        public void close() {
+            it = null;
+        }
+    }
 }
 
