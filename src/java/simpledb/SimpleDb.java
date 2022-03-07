@@ -7,11 +7,13 @@ import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
 import java.io.*;
+import java.util.Arrays;
 
 public class SimpleDb {
     public static void main (String[] args)
             throws DbException, TransactionAbortedException {
         // convert a file
+        System.err.printf("args=%s", Arrays.toString(args));
         switch (args[0]) {
             case "convert":
                 try {
