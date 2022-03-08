@@ -9,6 +9,7 @@ import simpledb.transaction.TransactionId;
 
 import java.io.*;
 
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -151,6 +152,13 @@ public class BufferPool {
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
+        DbFile dbFile = Database.getCatalog().getDatabaseFile(tableId);
+        List<Page> modifiedPages = dbFile.insertTuple(tid, t);
+        for (Page page : modifiedPages) {
+            page.markDirty(true, tid);
+            // todo: 驱逐
+            this.pages.put(page.getId(), page);
+        }
     }
 
     /**
@@ -170,6 +178,13 @@ public class BufferPool {
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
+        DbFile dbFile = Database.getCatalog().getDatabaseFile(t.getRecordId().getPageId().getTableId());
+        List<Page> modifiedPages = dbFile.deleteTuple(tid, t);
+        for (Page page : modifiedPages) {
+            page.markDirty(true, tid);
+            // todo: 驱逐
+            this.pages.put(page.getId(), page);
+        }
     }
 
     /**

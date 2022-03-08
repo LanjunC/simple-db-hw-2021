@@ -25,6 +25,9 @@ public class HeapPage implements Page {
     final Tuple[] tuples;
     final int numSlots;
 
+    private TransactionId dirtyId;
+    private boolean isDirty;
+
     byte[] oldData;
     private final Byte oldDataLock= (byte) 0;
 
@@ -253,6 +256,17 @@ public class HeapPage implements Page {
     public void deleteTuple(Tuple t) throws DbException {
         // some code goes here
         // not necessary for lab1
+        int tupleNo = t.getRecordId().getTupleNumber();
+        if (!isSlotUsed(tupleNo)) {
+            throw new DbException("the slot is already empty");
+        }
+        if (tuples[tupleNo] == null) {
+            throw new DbException("the tuple does not exist");
+        }
+        markSlotUsed(tupleNo, false);
+        tuples[tupleNo] = null;
+
+
     }
 
     /**
@@ -265,6 +279,20 @@ public class HeapPage implements Page {
     public void insertTuple(Tuple t) throws DbException {
         // some code goes here
         // not necessary for lab1
+        if (getNumEmptySlots() == 0) {
+            throw new DbException("unable to insert tuple because page is full");
+        }
+        if (!this.td.equals(t.getTupleDesc())) {
+            throw new DbException("unable to insert tuple because tupledesc is mismatch.");
+        }
+        for (int i = 0; i < this.numSlots; i++) {
+            if(!isSlotUsed(i)) {
+                markSlotUsed(i, true);
+                t.setRecordId(new RecordId(this.pid, i));
+                tuples[i] = t;
+                return;
+            }
+        }
     }
 
     /**
@@ -273,7 +301,9 @@ public class HeapPage implements Page {
      */
     public void markDirty(boolean dirty, TransactionId tid) {
         // some code goes here
-	// not necessary for lab1
+	    // not necessary for lab1
+        this.dirtyId = tid;
+        this.isDirty = dirty;
     }
 
     /**
@@ -282,7 +312,7 @@ public class HeapPage implements Page {
     public TransactionId isDirty() {
         // some code goes here
 	// Not necessary for lab1
-        return null;      
+        return this.isDirty ? dirtyId : null;
     }
 
     /**
@@ -310,9 +340,16 @@ public class HeapPage implements Page {
     /**
      * Abstraction to fill or clear a slot on this page.
      */
-    private void markSlotUsed(int i, boolean value) {
+    private void markSlotUsed(int i, boolean used) {
         // some code goes here
         // not necessary for lab1
+        byte b = header[i / 8];
+        byte mask = (byte) (1 << (i % 8));
+        if (used) {
+            header[i / 8] = (byte) (b|mask);
+        } else {
+            header[i / 8] = (byte) (b &(~mask));
+        }
     }
 
     /**
