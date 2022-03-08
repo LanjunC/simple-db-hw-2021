@@ -25,7 +25,7 @@ public class HeapFile implements DbFile {
 
     private final File file;
     private final TupleDesc tupleDesc;
-    //冗余信息. An ID uniquely identifying this HeapFile.
+    // 冗余信息. An ID uniquely identifying this HeapFile.
     // Return the same value for a particular HeapFile.
     // 实际上就是tableId。
     private final int heapFileId;

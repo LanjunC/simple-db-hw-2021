@@ -1,7 +1,5 @@
 package simpledb.common;
 
-import com.sun.xml.internal.ws.api.model.CheckedException;
-import simpledb.common.Type;
 import simpledb.storage.DbFile;
 import simpledb.storage.HeapFile;
 import simpledb.storage.TupleDesc;
