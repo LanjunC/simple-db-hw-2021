@@ -9,7 +9,9 @@ import simpledb.transaction.TransactionId;
 
 import java.io.*;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -85,6 +87,11 @@ public class BufferPool {
             // Attention here.
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             Page page = dbFile.readPage(pid);
+            // todo: evictPage IOExeption会导致flus、
+            //  失]==[/.;p-p;.lo09ok   mj88un  hy76tgv  fr54dxsw2qa1 败
+            if (this.pages.size() > numPages) {
+                evictPage();
+            }
             pages.put(pid, page);
         }
         return pages.get(pid);
@@ -152,11 +159,16 @@ public class BufferPool {
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
+        System.out.println("start insert");
         DbFile dbFile = Database.getCatalog().getDatabaseFile(tableId);
         List<Page> modifiedPages = dbFile.insertTuple(tid, t);
         for (Page page : modifiedPages) {
             page.markDirty(true, tid);
-            // todo: 驱逐
+            // todo: evictPage IOExeption会导致flush失败
+            if (this.pages.size() > numPages) {
+                System.out.println("evit start");
+                evictPage();
+            }
             this.pages.put(page.getId(), page);
         }
     }
@@ -182,7 +194,10 @@ public class BufferPool {
         List<Page> modifiedPages = dbFile.deleteTuple(tid, t);
         for (Page page : modifiedPages) {
             page.markDirty(true, tid);
-            // todo: 驱逐
+            // todo: evictPage IOExeption会导致flush失败
+            if (this.pages.size() > numPages) {
+                evictPage();
+            }
             this.pages.put(page.getId(), page);
         }
     }
@@ -195,6 +210,9 @@ public class BufferPool {
     public synchronized void flushAllPages() throws IOException {
         // some code goes here
         // not necessary for lab1
+        for (Map.Entry<PageId, Page> entry : this.pages.entrySet()) {
+            flushPage(entry.getKey());
+        }
 
     }
 
@@ -209,6 +227,7 @@ public class BufferPool {
     public synchronized void discardPage(PageId pid) {
         // some code goes here
         // not necessary for lab1
+        this.pages.remove(pid);
     }
 
     /**
@@ -218,6 +237,12 @@ public class BufferPool {
     private synchronized  void flushPage(PageId pid) throws IOException {
         // some code goes here
         // not necessary for lab1
+        Page page = this.pages.get(pid);
+        if (page.isDirty() != null) {
+            DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+            dbFile.writePage(page);
+            page.markDirty(false, null);
+        }
     }
 
     /** Write all pages of the specified transaction to disk.
@@ -234,6 +259,14 @@ public class BufferPool {
     private synchronized  void evictPage() throws DbException {
         // some code goes here
         // not necessary for lab1
+        PageId pageId = new ArrayList<>(this.pages.keySet()).get(0);
+        try {
+            this.flushPage(pageId);
+            this.discardPage(pageId);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
     }
 
 }
