@@ -11,6 +11,7 @@ import org.junit.Assert;
 import simpledb.common.Database;
 import simpledb.common.DbException;
 import simpledb.execution.Predicate;
+import simpledb.execution.SeqScan;
 import simpledb.optimizer.TableStats;
 import simpledb.storage.Field;
 import simpledb.storage.HeapFile;
@@ -18,6 +19,7 @@ import simpledb.storage.IntField;
 import simpledb.systemtest.SimpleDbTestBase;
 import simpledb.systemtest.SystemTestUtil;
 import simpledb.transaction.TransactionAbortedException;
+import simpledb.transaction.TransactionId;
 
 public class TableStatsTest extends SimpleDbTestBase {
 	public static final int IO_COST = 71;
@@ -34,7 +36,13 @@ public class TableStatsTest extends SimpleDbTestBase {
 		
 		this.tableName = SystemTestUtil.getUUID();
 		Database.getCatalog().addTable(f, tableName);
-		this.tableId = Database.getCatalog().getTableId(tableName);		
+		this.tableId = Database.getCatalog().getTableId(tableName);
+//
+//		SeqScan ss = new SeqScan(new TransactionId(), this.tableId);
+//		ss.open();
+//		while(ss.hasNext()) {
+//			System.out.println(ss.next());
+//		}
 	}
 	
 	private double[] getRandomTableScanCosts(int[] pageNums, int[] ioCosts) throws IOException {

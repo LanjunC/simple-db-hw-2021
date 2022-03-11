@@ -2,9 +2,18 @@ package simpledb.optimizer;
 
 import simpledb.execution.Predicate;
 
+import java.util.Arrays;
+
 /** A class to represent a fixed-width histogram over a single integer-based field.
  */
 public class IntHistogram {
+
+    private final int[] buckets;
+    private final int min;
+    private final int max;
+    private final double width;
+    private int ntups;
+
 
     /**
      * Create a new IntHistogram.
@@ -18,12 +27,17 @@ public class IntHistogram {
      * constant with respect to the number of values being histogrammed.  For example, you shouldn't 
      * simply store every value that you see in a sorted list.
      * 
-     * @param buckets The number of buckets to split the input value into.
+     * @param bucketsNum The number of buckets to split the input value into.
      * @param min The minimum integer value that will ever be passed to this class for histogramming
      * @param max The maximum integer value that will ever be passed to this class for histogramming
      */
-    public IntHistogram(int buckets, int min, int max) {
+    public IntHistogram(int bucketsNum, int min, int max) {
     	// some code goes here
+        this.buckets = new int[bucketsNum];
+        this.min = min;
+        this.max = max;
+        this.width = (max - min + 1.0) / bucketsNum;
+        this.ntups = 0;
     }
 
     /**
@@ -32,6 +46,12 @@ public class IntHistogram {
      */
     public void addValue(int v) {
     	// some code goes here
+        if (v < min || v > max) {
+            throw new IllegalArgumentException("value out of range");
+        }
+        int idx = (int)((v - min) / width);
+        buckets[idx]++;
+        ntups++;
     }
 
     /**
@@ -47,7 +67,34 @@ public class IntHistogram {
     public double estimateSelectivity(Predicate.Op op, int v) {
 
     	// some code goes here
-        return -1.0;
+        int idx = -1;
+        switch (op) {
+            case LESS_THAN:
+                if (v <= this.min) return 0.0;
+                if (v > this.max) return 1.0;
+                idx = (int)((v - this.min) / this.width);
+                double cnt = 0.0;
+                for (int i = 0; i < idx; i++) {
+                    cnt += this.buckets[i];
+                }
+                cnt += this.buckets[idx] * ((v - (this.min + this.width * idx)) / this.width);
+                return cnt / this.ntups;
+            case LESS_THAN_OR_EQ:
+                return estimateSelectivity(Predicate.Op.LESS_THAN, v + 1);
+            case EQUALS:
+                if (v < this.min) return 0.0;
+                if (v > this.max) return 0.0;
+                idx = (int)((v - this.min) / this.width);
+                return this.buckets[idx] / (this.width * ntups);
+            case NOT_EQUALS:
+                return 1 - estimateSelectivity(Predicate.Op.EQUALS, v);
+            case GREATER_THAN_OR_EQ:
+                return 1 - estimateSelectivity(Predicate.Op.LESS_THAN, v);
+            case GREATER_THAN:
+                return 1 - estimateSelectivity(Predicate.Op.LESS_THAN_OR_EQ, v);
+            default:
+                throw new IllegalArgumentException(String.format("unimplemented op %s", op));
+        }
     }
     
     /**
@@ -61,6 +108,7 @@ public class IntHistogram {
     public double avgSelectivity()
     {
         // some code goes here
+        // todo
         return 1.0;
     }
     
@@ -69,6 +117,7 @@ public class IntHistogram {
      */
     public String toString() {
         // some code goes here
-        return null;
+        return String.format("IntHistogram: min = %d max = %d buckets = %s", this.min, this.max,
+                Arrays.toString(this.buckets));
     }
 }

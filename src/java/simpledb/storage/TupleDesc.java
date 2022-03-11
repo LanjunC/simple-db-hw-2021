@@ -110,6 +110,14 @@ public class TupleDesc implements Serializable {
         return tdItems[i].fieldName;
     }
 
+    public String[] getFieldNames() {
+        String[] fieldNames = new String[tdItems.length];
+        for (int i = 0; i < tdItems.length; i++) {
+            fieldNames[i] = tdItems[i].fieldName;
+        }
+        return fieldNames;
+    }
+
     /**
      * Gets the type of the ith field of this TupleDesc.
      * 
@@ -126,6 +134,14 @@ public class TupleDesc implements Serializable {
             throw new NoSuchElementException("invalid index " + i);
         }
         return tdItems[i].fieldType;
+    }
+
+    public Type[] getFielTypes() {
+        Type[] fieldTypes = new Type[tdItems.length];
+        for (int i = 0; i < tdItems.length; i++) {
+            fieldTypes[i] = tdItems[i].fieldType;
+        }
+        return fieldTypes;
     }
 
     /**

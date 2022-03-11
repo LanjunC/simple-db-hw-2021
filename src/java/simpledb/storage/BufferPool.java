@@ -4,14 +4,13 @@ import simpledb.common.Database;
 import simpledb.common.Permissions;
 import simpledb.common.DbException;
 import simpledb.common.DeadlockException;
+import simpledb.transaction.Transaction;
 import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
 
 import java.io.*;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -38,6 +37,115 @@ public class BufferPool {
 
     private final int numPages;
     private final ConcurrentHashMap<PageId, Page> pages;
+    private final LockManager lockManager;
+
+
+    // lab4
+    // todo：读一下java读写锁，尽管java读写锁是基于thread去锁的，在这个lab无法管用
+    private class Lock {
+        private TransactionId transactionId;
+        private LockType lockType;
+
+        public Lock(TransactionId tid, LockType type) {
+            this.transactionId = tid;
+            this.lockType = type;
+        }
+    }
+
+    // page-level lock manager
+    private class LockManager {
+        ConcurrentHashMap<PageId, Vector<Lock>> lockMap;
+
+        public LockManager() {
+            lockMap = new ConcurrentHashMap<>();
+        }
+
+        public synchronized boolean acquireLock(TransactionId tid, PageId pid, LockType lockType) {
+            // 该pid的page还未上锁
+            if (!lockMap.containsKey(pid)) {
+                Vector<Lock> vector = new Vector<>();
+                vector.add(new Lock(tid, lockType));
+                lockMap.put(pid, vector);
+                return true;
+            }
+            Vector<Lock> locks = lockMap.get(pid);
+            for (Lock lock : locks) {
+                // 该tid已经对此page有上锁
+                if (lock.transactionId == tid) {
+                    // 该tid申请的lockType已经有上锁
+                    if (lock.lockType == lockType) {
+                        return true;
+                    }
+                    // 该tid申请shared_lock，但已上exclusive_lock
+                    if (lockType == LockType.SHARED_LOCK) {
+                        return true;
+                    }
+                    // 该tid申请exclusive_lock，但已上shared_lock
+                    // 只有自己的tid有在该page上锁，直接升级即可
+                    if (locks.size() == 1) {
+                        lock.lockType = LockType.EXCLUSIVE_LOCK;
+                        return true;
+                    }
+                    // 还有其他的tid有在该page上锁，无法升级
+                    // ps：读优先锁
+                    return false;
+                }
+            }
+            // locks中没有该pid, 且locks中已有exclusive_lock
+            if (locks.get(0).lockType == LockType.EXCLUSIVE_LOCK) {
+                if (locks.size() > 1) {
+                    String s = String.format("lockmanager contains more than one lock and at lease one exclusive_lock in page = %s", pid);
+                    throw new RuntimeException(s);
+                }
+                return false;
+
+            }
+            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是shared_lock
+            if (lockType == LockType.SHARED_LOCK) {
+                Lock lock = new Lock(tid, LockType.SHARED_LOCK);
+                locks.add(lock);
+                return true;
+            }
+            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是exclusive_lock
+            return false;
+        }
+
+        public synchronized boolean releaseLock(TransactionId tid, PageId pid) {
+            if (!lockMap.containsKey(pid)) {
+//                throw new IllegalArgumentException(String.format("unlocked page: %s", pid));
+                return false;
+            }
+            Vector<Lock> locks = lockMap.get(pid);
+            for (Lock lock : locks) {
+                if (lock.transactionId == tid) {
+                    locks.remove(lock); // 迭代中进行删除，迭代已失效
+                    if (locks.size() == 0) {
+                        lockMap.remove(pid);
+                    }
+                    return true;
+                }
+            }
+            // tid not found
+            return false;
+        }
+
+        public synchronized boolean holdsLock(TransactionId tid, PageId pid) {
+            if (!lockMap.containsKey(pid)) {
+                return false;
+            }
+            Vector<Lock> locks = lockMap.get(pid);
+            for (Lock lock : locks) {
+                if (lock.transactionId == tid) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private enum LockType {
+        SHARED_LOCK, EXCLUSIVE_LOCK
+    }
 
     /**
      * Creates a BufferPool that caches up to numPages pages.
@@ -48,6 +156,7 @@ public class BufferPool {
         // some code goes here
         this.numPages = numPages;
         pages = new ConcurrentHashMap<>();
+        lockManager = new LockManager();
     }
     
     public static int getPageSize() {
@@ -81,14 +190,28 @@ public class BufferPool {
      */
     public  Page getPage(TransactionId tid, PageId pid, Permissions perm)
         throws TransactionAbortedException, DbException {
-        // some code goes here
+        // 增删改查事务通过getPage方法来获取锁
+        LockType lockType = LockType.SHARED_LOCK;
+        if (perm != Permissions.READ_ONLY) {
+            lockType = LockType.EXCLUSIVE_LOCK;
+        }
+        boolean acquired = false;
+        long start = System.currentTimeMillis();
+        long timeout = new Random().nextInt(1000) + 1000;
+        while(!acquired) {
+            long end = System.currentTimeMillis();
+            if (end - start > timeout) {
+                throw new TransactionAbortedException();
+            }
+            acquired = lockManager.acquireLock(tid, pid, lockType);
+        }
+
         if (!pages.containsKey(pid)) {
             // If the page is not present, it should be added to the buffer pool.
             // Attention here.
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             Page page = dbFile.readPage(pid);
-            // todo: evictPage IOExeption会导致flus、
-            //  失]==[/.;p-p;.lo09ok   mj88un  hy76tgv  fr54dxsw2qa1 败
+            // todo: evictPage IOExeption会导致flush失败
             if (this.pages.size() > numPages) {
                 evictPage();
             }
@@ -109,6 +232,8 @@ public class BufferPool {
     public  void unsafeReleasePage(TransactionId tid, PageId pid) {
         // some code goes here
         // not necessary for lab1|lab2
+        // 为啥要加unsafe...
+        lockManager.releaseLock(tid, pid); // ??
     }
 
     /**
@@ -125,7 +250,7 @@ public class BufferPool {
     public boolean holdsLock(TransactionId tid, PageId p) {
         // some code goes here
         // not necessary for lab1|lab2
-        return false;
+        return lockManager.holdsLock(tid, p);
     }
 
     /**

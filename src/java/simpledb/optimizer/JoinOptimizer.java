@@ -130,7 +130,7 @@ public class JoinOptimizer {
             // HINT: You may need to use the variable "j" if you implemented
             // a join algorithm that's more complicated than a basic
             // nested-loops join.
-            return -1.0;
+            return cost1 + card1 * cost2 + card1 * card2;
         }
     }
 
@@ -176,6 +176,23 @@ public class JoinOptimizer {
                                                    Map<String, Integer> tableAliasToId) {
         int card = 1;
         // some code goes here
+        // 实验指导对这块有说明，这块本身是无法比较精确的估计的
+
+        if (joinOp == Predicate.Op.EQUALS) {
+            // 对于等价连接，当其中一个属性是主键时，由连接产生的 tuples 的数量不能大于非主键属性的cardinality。
+            if (t1pkey) {
+                card = card2;
+            } else if (t2pkey) {
+                card = card1;
+            } else {
+                // 无主键的等值连接， 谁cardinality用谁
+                card = Math.max(card1, card2);
+            }
+        } else {
+            // 非等值连接，取经验值
+            card = (int)(card1 * card2 * 0.3);
+        }
+
         return card <= 0 ? 1 : card;
     }
 
@@ -190,25 +207,45 @@ public class JoinOptimizer {
      * @return a set of all subsets of the specified size
      */
     public <T> Set<Set<T>> enumerateSubsets(List<T> v, int size) {
+//        Set<Set<T>> els = new HashSet<>();
+//        els.add(new HashSet<>());
+//        // Iterator<Set> it;
+//        // long start = System.currentTimeMillis();
+
+//        for (int i = 0; i < size; i++) {
+//            Set<Set<T>> newels = new HashSet<>();
+//            for (Set<T> s : els) {
+//                for (T t : v) {
+//                    Set<T> news = new HashSet<>(s);
+//                    if (news.add(t))
+//                        newels.add(news);
+//                }
+//            }
+//            els = newels;
+//        }
+//
+//
+//        return els;
+
+        // 原来给的方法会new过多对象，需要优化
         Set<Set<T>> els = new HashSet<>();
-        els.add(new HashSet<>());
-        // Iterator<Set> it;
-        // long start = System.currentTimeMillis();
-
-        for (int i = 0; i < size; i++) {
-            Set<Set<T>> newels = new HashSet<>();
-            for (Set<T> s : els) {
-                for (T t : v) {
-                    Set<T> news = new HashSet<>(s);
-                    if (news.add(t))
-                        newels.add(news);
-                }
-            }
-            els = newels;
-        }
-
+        dfs(els, v, size, 0, new Stack<T>());
         return els;
+    }
 
+    // serve for enumerateSubsets
+    private <T> void dfs(Set<Set<T>> els, List<T> v, int size, int curIdx, Stack<T> path) {
+        if (path.size() == size) {
+            els.add(new HashSet<>(path));
+            return;
+        }
+        if (curIdx == size) {
+            return;
+        }
+        path.push(v.get(curIdx));
+        dfs(els, v, size, curIdx + 1, path);
+        path.pop();
+        dfs(els, v, size, curIdx + 1, path);
     }
 
     /**
@@ -237,8 +274,43 @@ public class JoinOptimizer {
             throws ParsingException {
 
         // some code goes here
-        //Replace the following
-        return joins;
+        // 一种植物
+        PlanCache planCache = new PlanCache();
+        Set<Set<LogicalJoinNode>> nodeSets = null;
+        for (int i = 1; i <= this.joins.size(); i++) {
+            // public <T> Set<Set<T>> enumerateSubsets(List<T> v, int size)
+            nodeSets = enumerateSubsets(this.joins, i);
+            for (Set<LogicalJoinNode> nodeSet : nodeSets) {
+                double costSoFar = Double.MAX_VALUE;
+                for (LogicalJoinNode node : nodeSet) {
+                    // private CostCard computeCostAndCardOfSubplan(Map<String, TableStats> stats,
+                    //                                             Map<String, Double> filterSelectivities,
+                    //                                             LogicalJoinNode joinToRemove,
+                    //                                             Set<LogicalJoinNode> joinSet,
+                    //                                             double bestCostSoFar,
+                    //                                             PlanCache pc)
+                    CostCard costCard = computeCostAndCardOfSubplan(stats, filterSelectivities, node, nodeSet, costSoFar, planCache);
+                    if (costCard == null) {
+                        continue;
+                    }
+                    if (costCard.cost < costSoFar) {
+                        costSoFar = costCard.cost;
+                        // public void addPlan(Set<LogicalJoinNode> s, double cost, int card, List<LogicalJoinNode> order)
+                        // addPlan：set作为map主键时若contains相同内容，则为同一个key
+                        planCache.addPlan(nodeSet, costSoFar, costCard.card, costCard.plan);
+                    }
+                }
+            }
+        }
+        // 最后的nodesets只有一个set，其包含所有node
+        List<LogicalJoinNode> res = null;
+        for (Set<LogicalJoinNode> nodeSet : nodeSets) {
+            res = planCache.getOrder(nodeSet);
+        }
+        if (explain) {
+            printJoins(res,planCache,stats,filterSelectivities);
+        }
+        return res;
     }
 
     // ===================== Private Methods =================================

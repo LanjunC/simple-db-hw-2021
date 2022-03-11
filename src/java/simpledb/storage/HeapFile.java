@@ -148,6 +148,12 @@ public class HeapFile implements DbFile {
         for (int i = 0; i <numPages(); i++) {
             HeapPage page = (HeapPage) Database.getBufferPool().getPage(tid, new HeapPageId(this.getId(), i), Permissions.READ_WRITE);
             if (page.getNumEmptySlots() == 0) {
+                // 实验文档提示：if a transaction t finds no free slot on a page p,
+                // t may immediately release the lock on p.
+                // Although this apparently contradicts the rules of two-phase locking,
+                // it is ok because t did not use any data from the page,
+                // such that a concurrent transaction t' which updated p cannot possibly effect the answer or outcome of t.
+                Database.getBufferPool().unsafeReleasePage(tid, page.getId());
                 continue;
             }
             page.insertTuple(t);
