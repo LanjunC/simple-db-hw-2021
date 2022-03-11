@@ -122,7 +122,8 @@ public class BufferPoolWriteTest extends TestUtil.CreateHeapFile {
         	assertEquals(i+1, p.getNumEmptySlots());
         }
     }
-    
+
+    // note: lab4时会过不了，因为HeapFileDuplicates insertTuple被重写了，预期中
     @Test public void handleManyDirtyPages() throws Exception {
     	HeapFileDuplicates hfd = new HeapFileDuplicates(empty.getFile(), empty.getTupleDesc(), 10);
     	Database.getCatalog().addTable(hfd, SystemTestUtil.getUUID());

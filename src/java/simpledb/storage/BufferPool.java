@@ -1,9 +1,6 @@
 package simpledb.storage;
 
-import simpledb.common.Database;
-import simpledb.common.Permissions;
-import simpledb.common.DbException;
-import simpledb.common.DeadlockException;
+import simpledb.common.*;
 import simpledb.transaction.Transaction;
 import simpledb.transaction.TransactionAbortedException;
 import simpledb.transaction.TransactionId;
@@ -11,6 +8,8 @@ import simpledb.transaction.TransactionId;
 import java.io.*;
 
 import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -37,7 +36,9 @@ public class BufferPool {
 
     private final int numPages;
     private final ConcurrentHashMap<PageId, Page> pages;
+    private final ArrayBlockingQueue<PageId> pageQueue; // for FIFO
     private final LockManager lockManager;
+    // todo 新增数据结构用于快速查找transactionId对应的page
 
 
     // lab4
@@ -156,6 +157,7 @@ public class BufferPool {
         // some code goes here
         this.numPages = numPages;
         pages = new ConcurrentHashMap<>();
+        pageQueue = new ArrayBlockingQueue<>(numPages);
         lockManager = new LockManager();
     }
     
@@ -212,10 +214,14 @@ public class BufferPool {
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             Page page = dbFile.readPage(pid);
             // todo: evictPage IOExeption会导致flush失败
-            if (this.pages.size() > numPages) {
+            if (this.pages.size() == numPages) {
                 evictPage();
             }
             pages.put(pid, page);
+            boolean b = pageQueue.offer(pid);
+            if (!b) {
+                throw new RuntimeException("The pageQueue is full when trying offer!!"); // 若这里出现异常，一定是出现了设计不合理处
+            }
         }
         return pages.get(pid);
     }
@@ -244,6 +250,7 @@ public class BufferPool {
     public void transactionComplete(TransactionId tid) {
         // some code goes here
         // not necessary for lab1|lab2
+        transactionComplete(tid, true);
     }
 
     /** Return true if the specified transaction has a lock on the specified page */
@@ -263,6 +270,34 @@ public class BufferPool {
     public void transactionComplete(TransactionId tid, boolean commit) {
         // some code goes here
         // not necessary for lab1|lab2
+        // 实验文档要求比较简单，假设transactionComplete will not crash during commit processing，因此*不需要实现基于日志的恢复*
+        if (commit) {
+            try {
+                flushPages(tid);
+            } catch (IOException e) {
+                e.printStackTrace();
+                return;
+            }
+        } else {
+            restorePages(tid);
+        }
+        for (PageId pid : pages.keySet()) {
+            if (holdsLock(tid, pid)) {
+                unsafeReleasePage(tid, pid);
+            }
+        }
+
+    }
+
+    private synchronized void restorePages(TransactionId tid) {
+        for (Map.Entry<PageId, Page> entry : this.pages.entrySet()) {
+            if (entry.getValue().isDirty() == tid) {
+                int tableId = entry.getKey().getTableId();
+                DbFile file = Database.getCatalog().getDatabaseFile(tableId);
+                Page restoredPage = file.readPage(entry.getKey());
+                pages.put(entry.getKey(), restoredPage); // 这里更新dirty状态为no了
+            }
+        }
     }
 
     /**
@@ -289,12 +324,13 @@ public class BufferPool {
         List<Page> modifiedPages = dbFile.insertTuple(tid, t);
         for (Page page : modifiedPages) {
             page.markDirty(true, tid);
+            // ps: deleteTuple底层为dbFile.deleteTuple，其中会做BufferPool.getPage，那里会做evictPage操作
             // todo: evictPage IOExeption会导致flush失败
-            if (this.pages.size() > numPages) {
-                System.out.println("evit start");
-                evictPage();
-            }
-            this.pages.put(page.getId(), page);
+//            if (this.pages.size() > numPages) {
+//                System.out.println("evict start");
+//                evictPage();
+//            }
+//            this.pages.put(page.getId(), page);
         }
     }
 
@@ -319,11 +355,12 @@ public class BufferPool {
         List<Page> modifiedPages = dbFile.deleteTuple(tid, t);
         for (Page page : modifiedPages) {
             page.markDirty(true, tid);
-            // todo: evictPage IOExeption会导致flush失败
-            if (this.pages.size() > numPages) {
-                evictPage();
-            }
-            this.pages.put(page.getId(), page);
+            // ps: deleteTuple底层为dbFile.deleteTuple，其中会做BufferPool.getPage，那里会做evictPage操作
+//            // todo: evictPage IOExeption会导致flush失败
+//            if (this.pages.size() > numPages) {
+//                evictPage();
+//            }
+//            this.pages.put(page.getId(), page);
         }
     }
 
@@ -375,6 +412,11 @@ public class BufferPool {
     public synchronized  void flushPages(TransactionId tid) throws IOException {
         // some code goes here
         // not necessary for lab1|lab2
+        for (Map.Entry<PageId, Page> entry: pages.entrySet()) {
+            if (entry.getValue().isDirty() == tid) {
+                flushPage(entry.getKey());
+            }
+        }
     }
 
     /**
@@ -384,14 +426,35 @@ public class BufferPool {
     private synchronized  void evictPage() throws DbException {
         // some code goes here
         // not necessary for lab1
-        PageId pageId = new ArrayList<>(this.pages.keySet()).get(0);
-        try {
-            this.flushPage(pageId);
-            this.discardPage(pageId);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
 
+        // hint: set lab4 2.6: Modifications from a transaction are written to disk only after it commits.
+        // This means we can abort a transaction by discarding the dirty pages and rereading them from disk.
+        // Thus, we must not evict dirty pages. This policy is called NO STEAL.
+
+//        PageId pageId = new ArrayList<>(this.pages.keySet()).get(0);
+//        try {
+//            this.flushPage(pageId);
+//            this.discardPage(pageId);
+//        } catch (IOException e) {
+//            e.printStackTrace();
+//        }
+        assert numPages == pages.size() : "evict page when BufferPool is not full！";
+        while(!pageQueue.isEmpty()) {
+            PageId pid = pageQueue.poll();
+            if (pages.get(pid) == null) {
+                // 被discard过的pageId,没有及时被pageQueue移除
+                continue;
+            }
+            if (pages.get(pid).isDirty() == null) {
+                // not dirty
+                discardPage(pid);
+                return;
+            }
+            // dirty，放过
+            pageQueue.offer(pid);
+        }
+        // 没有找到not dirty page，无可驱逐的page
+        throw new DbException("no clean page to evict!"); //lab4
     }
 
 }
