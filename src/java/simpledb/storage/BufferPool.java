@@ -198,6 +198,7 @@ public class BufferPool {
             lockType = LockType.EXCLUSIVE_LOCK;
         }
         boolean acquired = false;
+        // 简单的timeout来检测死锁， todo 改进方法
         long start = System.currentTimeMillis();
         long timeout = new Random().nextInt(1000) + 1000;
         while(!acquired) {
@@ -439,8 +440,15 @@ public class BufferPool {
 //            e.printStackTrace();
 //        }
         assert numPages == pages.size() : "evict page when BufferPool is not full！";
+        PageId startId = null;
         while(!pageQueue.isEmpty()) {
             PageId pid = pageQueue.poll();
+            if (startId == null) {
+                startId = pid;
+            } else if (pid == startId) {
+                // 队列中只剩dirty page
+                break;
+            }
             if (pages.get(pid) == null) {
                 // 被discard过的pageId,没有及时被pageQueue移除
                 continue;
