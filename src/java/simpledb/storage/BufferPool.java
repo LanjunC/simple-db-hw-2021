@@ -11,6 +11,8 @@ import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * BufferPool manages the reading and writing of pages into memory from
@@ -35,112 +37,357 @@ public class BufferPool {
     public static final int DEFAULT_PAGES = 50;
 
     private final int numPages;
-    private final ConcurrentHashMap<PageId, Page> pages;
-    private final ArrayBlockingQueue<PageId> pageQueue; // for FIFO
+    private final lruPageCache cache;
+//    private final ConcurrentHashMap<PageId, Page> pages;
+//    private final ArrayBlockingQueue<PageId> pageQueue; // for FIFO
     private final LockManager lockManager;
-    // todo 新增数据结构用于快速查找transactionId对应的page
 
+    /*
+        2021/5/1
+        新增 lru cache 代替 fifo
+    */
+    private class lruNode {
+        private PageId pageId;
+        private Page page;
+        private lruNode prev;
+        private lruNode next;
+
+        public lruNode(){}
+
+        public lruNode(PageId pageId, Page page) {
+            this.pageId = pageId;
+            this.page = page;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            lruNode lruNode = (lruNode) o;
+            return Objects.equals(pageId, lruNode.pageId);
+        }
+    }
+
+    private class lruPageCache {
+        private ReentrantReadWriteLock rwlock; // 貌似没必要？
+        private int cap;
+        private final Map<PageId, lruNode> pages;
+        private final lruNode head;
+        private final lruNode tail;
+
+        public lruPageCache(int cap) {
+            rwlock = new ReentrantReadWriteLock();
+            this.cap = cap;
+            this.pages = new HashMap<>();
+            head = new lruNode();
+            tail = new lruNode();
+            head.next = tail;
+            tail.prev = head;
+        }
+
+        public Page get(PageId pageId) {
+            this.rwlock.readLock().lock();
+            try {
+                lruNode node = pages.get(pageId);
+                if (node == null) {
+                    return null;
+                }
+                deleteNode(node);
+                addToHead(node);
+                return node.page;
+            } finally {
+                this.rwlock.readLock().unlock();
+            }
+        }
+
+        public void put(PageId pageId, Page page, boolean noSteal) throws DbException{
+            this.rwlock.writeLock().lock();
+            try {
+                lruNode node = pages.get(pageId);
+                if (node != null) {
+                    node.page = page;
+                    deleteNode(node);
+                    addToHead(node);
+                } else {
+                    if (pages.size() == cap) {
+                        if (noSteal) {
+                            lruNode scanned = tail.prev;
+                            for (; !scanned.equals(head); scanned = scanned.prev) {
+                                Page scannedPage = scanned.page;
+                                if (scannedPage.isDirty() == null) {
+                                    discard(scannedPage.getId());
+                                    break;
+                                }
+                            }
+                            if (scanned.equals(head)) {
+                                // 没有找到not dirty page，无可驱逐的page
+                                throw new DbException("no clean page to evict!"); //lab4
+                            }
+                        } else {
+                            discard(tail.prev.pageId);
+                        }
+                    }
+                    node = new lruNode(pageId, page);
+                    pages.put(pageId, node);
+                    addToHead(node);
+
+                }
+            } finally {
+                this.rwlock.writeLock().unlock();
+            }
+        }
+
+        public int size() {
+            this.rwlock.readLock().lock();
+            try {
+                return pages.size();
+            } finally {
+                this.rwlock.readLock().unlock();
+            }
+        }
+
+        public boolean discard(PageId pid) {
+            this.rwlock.writeLock().lock();
+            try {
+                lruNode discarded = pages.get(pid);
+                if (discarded == null) {
+                    return false;
+                }
+                deleteNode(discarded);
+                pages.remove(pid);
+                return true;
+            } finally {
+                this.rwlock.writeLock().unlock();
+            }
+
+        }
+
+        public Set<PageId> getAllPageIds() {
+            this.rwlock.readLock().lock();
+            try {
+                return new HashSet<>(this.pages.keySet());
+            } finally {
+                this.rwlock.readLock().unlock();
+            }
+        }
+
+        private void addToHead(lruNode node) {
+            node.next = head.next;
+            node.prev = head;
+            head.next.prev = node;
+            head.next = node;
+        }
+
+        private void deleteNode(lruNode node) {
+            node.next.prev = node.prev;
+            node.prev.next = node.next;
+        }
+    }
 
     // lab4
     // todo：读一下java读写锁，尽管java读写锁是基于thread去锁的，在这个lab无法管用
     private class Lock {
         private TransactionId transactionId;
+        private PageId pageId;
         private LockType lockType;
 
-        public Lock(TransactionId tid, LockType type) {
+        public Lock(TransactionId tid, PageId pid, LockType type) {
             this.transactionId = tid;
+            this.pageId = pid;
             this.lockType = type;
         }
     }
 
     // page-level lock manager
+    /* 2022.5.2 新增tid到 locks的映射,并且locks的组织形式由vector换为map */
     private class LockManager {
-        ConcurrentHashMap<PageId, Vector<Lock>> lockMap;
+        ConcurrentHashMap<PageId, ConcurrentHashMap<TransactionId, Lock>> pidToLocksMap;
+        ConcurrentHashMap<TransactionId, ConcurrentHashMap<PageId, Lock>> tidToLocksMap;
+
 
         public LockManager() {
-            lockMap = new ConcurrentHashMap<>();
+            pidToLocksMap = new ConcurrentHashMap<>();
+            tidToLocksMap = new ConcurrentHashMap<>();
         }
 
         public synchronized boolean acquireLock(TransactionId tid, PageId pid, LockType lockType) {
+            boolean done = false; // 已确定要上锁,无需后续流程
+            Lock newLock = new Lock(tid, pid, lockType);
             // 该pid的page还未上锁
-            if (!lockMap.containsKey(pid)) {
-                Vector<Lock> vector = new Vector<>();
-                vector.add(new Lock(tid, lockType));
-                lockMap.put(pid, vector);
+            if (!pidToLocksMap.containsKey(pid)) {
+                ConcurrentHashMap<TransactionId, Lock> locks = new ConcurrentHashMap<>();
+                pidToLocksMap.put(pid, locks);
+                done = true;
+            }
+            // 该事务未持有任何锁
+            if (!tidToLocksMap.containsKey(tid)) {
+                ConcurrentHashMap<PageId, Lock> locks = new ConcurrentHashMap<>();
+                tidToLocksMap.put(tid, locks);
+            }
+            if (done) {
+                pidToLocksMap.get(pid).put(tid, newLock);
+                tidToLocksMap.get(tid).put(pid, newLock);
                 return true;
             }
-            Vector<Lock> locks = lockMap.get(pid);
-            for (Lock lock : locks) {
-                // 该tid已经对此page有上锁
-                if (lock.transactionId == tid) {
-                    // 该tid申请的lockType已经有上锁
-                    if (lock.lockType == lockType) {
-                        return true;
+
+//            Vector<Lock> locks = pidToLocksMap.get(pid);
+//            for (Lock lock : locks) {
+//                // 该tid已经对此page有上锁
+//                if (lock.transactionId == tid) {
+//                    // 该tid申请的lockType已经有上锁
+//                    if (lock.lockType == lockType) {
+//                        return true;
+//                    }
+//                    // 该tid申请shared_lock，但已上exclusive_lock
+//                    if (lockType == LockType.SHARED_LOCK) {
+//                        return true;
+//                    }
+//                    // 该tid申请exclusive_lock，但已上shared_lock
+//                    // 只有自己的tid有在该page上锁，直接升级即可
+//                    if (locks.size() == 1) {
+//                        lock.lockType = LockType.EXCLUSIVE_LOCK;
+//                        return true;
+//                    }
+//                    // 还有其他的tid有在该page上锁，无法升级
+//                    // ps：读优先锁
+//                    return false;
+//                }
+//            }
+//            // locks中没有该pid, 且locks中已有exclusive_lock
+//            if (locks.get(0).lockType == LockType.EXCLUSIVE_LOCK) {
+//                if (locks.size() > 1) {
+//                    String s = String.format("lockmanager contains more than one lock and at lease one exclusive_lock in page = %s", pid);
+//                    throw new RuntimeException(s);
+//                }
+//                return false;
+//
+//            }
+//            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是shared_lock
+//            if (lockType == LockType.SHARED_LOCK) {
+//                Lock lock = new Lock(tid, LockType.SHARED_LOCK);
+//                locks.add(lock);
+//                return true;
+//            }
+//            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是exclusive_lock
+//            return false;
+
+            Lock oldLock = tidToLocksMap.get(tid).get(pid);
+            // 该tid已持有对该pid的锁
+            if (oldLock != null) {
+                // 该tid已持有对应类型锁
+                if (oldLock.lockType == lockType) {
+                    return true;
+                }
+                // 该tid申请shared_lock，但已上exclusive_lock
+                if (lockType == LockType.SHARED_LOCK) {
+                    return true;
+                }
+                // 该tid申请exclusive_lock，但已上shared_lock
+                // 1. 只有自己的tid有在该page上锁，直接升级即可
+                if (pidToLocksMap.get(pid).size() == 1) {
+                    oldLock.lockType = LockType.EXCLUSIVE_LOCK;
+                    return true;
+                }
+                // 2. 还有其他的tid有在该page上锁，无法升级
+                // ps：读优先锁 todo:是否可做成写优先
+                return false;
+            } else { // 该tid未持有对该pid的锁
+                // 该pid还未上任何锁, 已在前面特判, 忽略
+                // ...
+                ConcurrentHashMap<TransactionId, Lock> locks = pidToLocksMap.get(pid);
+                // 只需检查第一个锁即可
+                for (Lock lock : locks.values()) {
+                    // 该pid已被加exclusive_lock
+                    if (lock.lockType == LockType.EXCLUSIVE_LOCK) {
+                        return false;
                     }
-                    // 该tid申请shared_lock，但已上exclusive_lock
+                    // 该pid未被加exclusive_lock, 且tid申请的是shared_lock
                     if (lockType == LockType.SHARED_LOCK) {
+                        pidToLocksMap.get(pid).put(tid, newLock);
+                        tidToLocksMap.get(tid).put(pid, newLock);
                         return true;
                     }
-                    // 该tid申请exclusive_lock，但已上shared_lock
-                    // 只有自己的tid有在该page上锁，直接升级即可
-                    if (locks.size() == 1) {
-                        lock.lockType = LockType.EXCLUSIVE_LOCK;
-                        return true;
-                    }
-                    // 还有其他的tid有在该page上锁，无法升级
-                    // ps：读优先锁
+                    // 该pid未被加exclusive_lock，且tid申请的是exclusive_lock
                     return false;
                 }
             }
-            // locks中没有该pid, 且locks中已有exclusive_lock
-            if (locks.get(0).lockType == LockType.EXCLUSIVE_LOCK) {
-                if (locks.size() > 1) {
-                    String s = String.format("lockmanager contains more than one lock and at lease one exclusive_lock in page = %s", pid);
-                    throw new RuntimeException(s);
-                }
-                return false;
-
-            }
-            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是shared_lock
-            if (lockType == LockType.SHARED_LOCK) {
-                Lock lock = new Lock(tid, LockType.SHARED_LOCK);
-                locks.add(lock);
-                return true;
-            }
-            // locks中没有该pid，且locks中没有exclusive_lock，且tid申请的是exclusive_lock
-            return false;
+            // 未知情形
+            String s = String.format("lockmanager: invalid operation when acquire lock(tid=%s, pid=%s, locktype=%s)",
+                    tid, pid, lockType);
+            throw new RuntimeException(s);
         }
 
         public synchronized boolean releaseLock(TransactionId tid, PageId pid) {
-            if (!lockMap.containsKey(pid)) {
-//                throw new IllegalArgumentException(String.format("unlocked page: %s", pid));
+//            if (!lockMap.containsKey(pid)) {
+////                throw new IllegalArgumentException(String.format("unlocked page: %s", pid));
+//                return false;
+//            }
+//            Vector<Lock> locks = lockMap.get(pid);
+//            for (Lock lock : locks) {
+//                if (lock.transactionId == tid) {
+//                    locks.remove(lock); // 迭代中进行删除，迭代已失效
+//                    if (locks.size() == 0) {
+//                        lockMap.remove(pid);
+//                    }
+//                    return true;
+//                }
+//            }
+//            // tid not found
+//            return false;
+            if (pidToLocksMap.get(pid) == null || pidToLocksMap.get(pid).get(tid) == null) {
                 return false;
             }
-            Vector<Lock> locks = lockMap.get(pid);
-            for (Lock lock : locks) {
-                if (lock.transactionId == tid) {
-                    locks.remove(lock); // 迭代中进行删除，迭代已失效
-                    if (locks.size() == 0) {
-                        lockMap.remove(pid);
-                    }
-                    return true;
-                }
+            pidToLocksMap.get(pid).remove(tid);
+            tidToLocksMap.get(tid).remove(pid);
+            if (pidToLocksMap.get(pid).size() == 0) {
+                pidToLocksMap.remove(pid);
             }
-            // tid not found
-            return false;
-        }
+            if (tidToLocksMap.get(tid).size() == 0) {
+                tidToLocksMap.remove(tid);
+            }
+            return true;
+         }
 
         public synchronized boolean holdsLock(TransactionId tid, PageId pid) {
-            if (!lockMap.containsKey(pid)) {
+//            if (!lockMap.containsKey(pid)) {
+//                return false;
+//            }
+//            Vector<Lock> locks = lockMap.get(pid);
+//            for (Lock lock : locks) {
+//                if (lock.transactionId == tid) {
+//                    return true;
+//                }
+//            }
+//            return false;
+            if (pidToLocksMap.get(pid) == null || pidToLocksMap.get(pid).get(tid) == null) {
                 return false;
             }
-            Vector<Lock> locks = lockMap.get(pid);
-            for (Lock lock : locks) {
-                if (lock.transactionId == tid) {
-                    return true;
+            return true;
+        }
+
+        // [todo]
+        public synchronized boolean releaseLock(TransactionId tid) {
+            if (tidToLocksMap.get(tid) == null) {
+                return false;
+            }
+            for (PageId pid : tidToLocksMap.get(tid).keySet()) {
+                releaseLock(tid, pid);
+            }
+            return true;
+        }
+
+        // [todo]
+        public synchronized Set<PageId> getDirtyPages(TransactionId tid) {
+            Set<PageId> dirtySet = new HashSet<>();
+            if (tidToLocksMap.get(tid) == null) {
+                return dirtySet;
+            }
+            for (Map.Entry<PageId, Lock> entry : tidToLocksMap.get(tid).entrySet()) {
+                if (entry.getValue().lockType == LockType.EXCLUSIVE_LOCK) {
+                    dirtySet.add(entry.getKey());
                 }
             }
-            return false;
+            return dirtySet;
         }
     }
 
@@ -156,8 +403,7 @@ public class BufferPool {
     public BufferPool(int numPages) {
         // some code goes here
         this.numPages = numPages;
-        pages = new ConcurrentHashMap<>();
-        pageQueue = new ArrayBlockingQueue<>(numPages);
+        cache = new lruPageCache(numPages);
         lockManager = new LockManager();
     }
     
@@ -209,22 +455,28 @@ public class BufferPool {
             acquired = lockManager.acquireLock(tid, pid, lockType);
         }
 
-        if (!pages.containsKey(pid)) {
-            // If the page is not present, it should be added to the buffer pool.
-            // Attention here.
+//        if (!pages.containsKey(pid)) {
+//            // If the page is not present, it should be added to the buffer pool.
+//            // Attention here.
+//            DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
+//            Page page = dbFile.readPage(pid);
+//            // todo: evictPage IOExeption会导致flush失败
+//            if (this.pages.size() == numPages) {
+//                evictPage();
+//            }
+//            pages.put(pid, page);
+//            boolean b = pageQueue.offer(pid);
+//            if (!b) {
+//                throw new RuntimeException("The pageQueue is full when trying offer!!"); // 若这里出现异常，一定是出现了设计不合理处
+//            }
+//        }
+//        return pages.get(pid);
+        if  (cache.get(pid) == null) {
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             Page page = dbFile.readPage(pid);
-            // todo: evictPage IOExeption会导致flush失败
-            if (this.pages.size() == numPages) {
-                evictPage();
-            }
-            pages.put(pid, page);
-            boolean b = pageQueue.offer(pid);
-            if (!b) {
-                throw new RuntimeException("The pageQueue is full when trying offer!!"); // 若这里出现异常，一定是出现了设计不合理处
-            }
+            cache.put(pid, page, true);
         }
-        return pages.get(pid);
+        return cache.get(pid);
     }
 
     /**
@@ -282,22 +534,36 @@ public class BufferPool {
         } else {
             restorePages(tid);
         }
-        for (PageId pid : pages.keySet()) {
-            if (holdsLock(tid, pid)) {
-                unsafeReleasePage(tid, pid);
-            }
-        }
+//        for (PageId pid : pages.keySet()) {
+//            if (holdsLock(tid, pid)) {
+//                unsafeReleasePage(tid, pid);
+//            }
+//        }
+        // 释放tid的所有page锁
+        lockManager.releaseLock(tid);
 
     }
 
     private synchronized void restorePages(TransactionId tid) {
-        for (Map.Entry<PageId, Page> entry : this.pages.entrySet()) {
-            if (entry.getValue().isDirty() == tid) {
-                int tableId = entry.getKey().getTableId();
+//        for (Map.Entry<PageId, Page> entry : this.pages.entrySet()) {
+//            if (entry.getValue().isDirty() == tid) {
+//                int tableId = entry.getKey().getTableId();
+//                DbFile file = Database.getCatalog().getDatabaseFile(tableId);
+//                Page restoredPage = file.readPage(entry.getKey());
+//                pages.put(entry.getKey(), restoredPage); // 这里更新dirty状态为no了
+//            }
+//        }
+        Set<PageId> dirtyPages = lockManager.getDirtyPages(tid);
+        for (PageId pid : dirtyPages) {
+            int tableId = pid.getTableId();
                 DbFile file = Database.getCatalog().getDatabaseFile(tableId);
-                Page restoredPage = file.readPage(entry.getKey());
-                pages.put(entry.getKey(), restoredPage); // 这里更新dirty状态为no了
-            }
+                Page restoredPage = file.readPage(pid);
+                try {
+                    cache.put(pid, restoredPage, true); // 这里更新dirty状态为no了
+                } catch (Exception e) {
+
+                    e.printStackTrace();
+                }
         }
     }
 
@@ -324,7 +590,7 @@ public class BufferPool {
         DbFile dbFile = Database.getCatalog().getDatabaseFile(tableId);
         List<Page> modifiedPages = dbFile.insertTuple(tid, t);
         for (Page page : modifiedPages) {
-            page.markDirty(true, tid);
+            page.markDirty(true, tid); // [todo]modified后mark前是否会出现page已被驱逐(考虑到bp容量,概率极低)
             // ps: deleteTuple底层为dbFile.deleteTuple，其中会做BufferPool.getPage，那里会做evictPage操作
             // todo: evictPage IOExeption会导致flush失败
 //            if (this.pages.size() > numPages) {
@@ -373,8 +639,9 @@ public class BufferPool {
     public synchronized void flushAllPages() throws IOException {
         // some code goes here
         // not necessary for lab1
-        for (Map.Entry<PageId, Page> entry : this.pages.entrySet()) {
-            flushPage(entry.getKey());
+        Set<PageId> pageIds = cache.getAllPageIds();
+        for (PageId pid : pageIds) {
+            flushPage(pid);
         }
 
     }
@@ -390,7 +657,7 @@ public class BufferPool {
     public synchronized void discardPage(PageId pid) {
         // some code goes here
         // not necessary for lab1
-        this.pages.remove(pid);
+        cache.discard(pid);
     }
 
     /**
@@ -400,7 +667,7 @@ public class BufferPool {
     private synchronized  void flushPage(PageId pid) throws IOException {
         // some code goes here
         // not necessary for lab1
-        Page page = this.pages.get(pid);
+        Page page = cache.get(pid);
         if (page.isDirty() != null) {
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             dbFile.writePage(page);
@@ -413,10 +680,14 @@ public class BufferPool {
     public synchronized  void flushPages(TransactionId tid) throws IOException {
         // some code goes here
         // not necessary for lab1|lab2
-        for (Map.Entry<PageId, Page> entry: pages.entrySet()) {
-            if (entry.getValue().isDirty() == tid) {
-                flushPage(entry.getKey());
-            }
+//        for (Map.Entry<PageId, Page> entry: pages.entrySet()) {
+//            if (entry.getValue().isDirty() == tid) {
+//                flushPage(entry.getKey());
+//            }
+//        }
+        Set<PageId> dirtyPages = lockManager.getDirtyPages(tid);
+        for (PageId pid : dirtyPages) {
+            flushPage(pid);
         }
     }
 
@@ -439,30 +710,32 @@ public class BufferPool {
 //        } catch (IOException e) {
 //            e.printStackTrace();
 //        }
-        assert numPages == pages.size() : "evict page when BufferPool is not full！";
-        PageId startId = null;
-        while(!pageQueue.isEmpty()) {
-            PageId pid = pageQueue.poll();
-            if (startId == null) {
-                startId = pid;
-            } else if (pid == startId) {
-                // 队列中只剩dirty page
-                break;
-            }
-            if (pages.get(pid) == null) {
-                // 被discard过的pageId,没有及时被pageQueue移除
-                continue;
-            }
-            if (pages.get(pid).isDirty() == null) {
-                // not dirty
-                discardPage(pid);
-                return;
-            }
-            // dirty，放过
-            pageQueue.offer(pid);
-        }
-        // 没有找到not dirty page，无可驱逐的page
-        throw new DbException("no clean page to evict!"); //lab4
+
+        /* 2022.5.2 evictPage交给lru保管 */
+//        assert numPages == pages.size() : "evict page when BufferPool is not full！";
+//        PageId startId = null;
+//        while(!pageQueue.isEmpty()) {
+//            PageId pid = pageQueue.poll();
+//            if (startId == null) {
+//                startId = pid;
+//            } else if (pid == startId) {
+//                // 队列中只剩dirty page
+//                break;
+//            }
+//            if (pages.get(pid) == null) {
+//                // 被discard过的pageId,没有及时被pageQueue移除
+//                continue;
+//            }
+//            if (pages.get(pid).isDirty() == null) {
+//                // not dirty
+//                discardPage(pid);
+//                return;
+//            }
+//            // dirty，放过
+//            pageQueue.offer(pid);
+//        }
+//        // 没有找到not dirty page，无可驱逐的page
+//        throw new DbException("no clean page to evict!"); //lab4
     }
 
 }
