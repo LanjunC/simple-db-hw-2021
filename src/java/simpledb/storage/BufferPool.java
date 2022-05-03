@@ -365,7 +365,6 @@ public class BufferPool {
             return true;
         }
 
-        // [todo]
         public synchronized boolean releaseLock(TransactionId tid) {
             if (tidToLocksMap.get(tid) == null) {
                 return false;
@@ -376,7 +375,6 @@ public class BufferPool {
             return true;
         }
 
-        // [todo]
         public synchronized Set<PageId> getDirtyPages(TransactionId tid) {
             Set<PageId> dirtySet = new HashSet<>();
             if (tidToLocksMap.get(tid) == null) {
@@ -590,7 +588,8 @@ public class BufferPool {
         DbFile dbFile = Database.getCatalog().getDatabaseFile(tableId);
         List<Page> modifiedPages = dbFile.insertTuple(tid, t);
         for (Page page : modifiedPages) {
-            page.markDirty(true, tid); // [todo]modified后mark前是否会出现page已被驱逐(考虑到bp容量,概率极低)
+            page.markDirty(true, tid);
+            cache.put(page.getId(), page, true);// modified后mark前可能会出现page已被驱逐(尤其是btree增删操作发生结构变更时会更新大量父结点指针)
             // ps: deleteTuple底层为dbFile.deleteTuple，其中会做BufferPool.getPage，那里会做evictPage操作
             // todo: evictPage IOExeption会导致flush失败
 //            if (this.pages.size() > numPages) {
@@ -622,6 +621,7 @@ public class BufferPool {
         List<Page> modifiedPages = dbFile.deleteTuple(tid, t);
         for (Page page : modifiedPages) {
             page.markDirty(true, tid);
+            cache.put(page.getId(), page, true);// modified后mark前可能会出现page已被驱逐(尤其是btree增删操作发生结构变更时会更新大量父结点指针)
             // ps: deleteTuple底层为dbFile.deleteTuple，其中会做BufferPool.getPage，那里会做evictPage操作
 //            // todo: evictPage IOExeption会导致flush失败
 //            if (this.pages.size() > numPages) {
@@ -687,7 +687,13 @@ public class BufferPool {
 //        }
         Set<PageId> dirtyPages = lockManager.getDirtyPages(tid);
         for (PageId pid : dirtyPages) {
-            flushPage(pid);
+            // 正常情况下cache和lockmanager保持一致性,但是单元测试BTreeFileInsertTest: testSplitInternalPages直接
+            // 跳过insert操作测试,导致不会出现insert结束mark dirty的操作, 因此这里不做null判断可能会报异常.
+            // 代码符合一致性,只是为了过测试进行特判
+            if (cache.get(pid) != null) {
+                flushPage(pid);
+
+            }
         }
     }
 
