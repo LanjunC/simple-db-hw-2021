@@ -1,11 +1,14 @@
 
 package simpledb.storage;
 
+import com.sun.corba.se.impl.orb.DataCollectorBase;
 import simpledb.common.Database;
 import simpledb.transaction.TransactionId;
 import simpledb.common.Debug;
+import sun.util.resources.ga.LocaleNames_ga;
 
 import java.io.*;
+import java.nio.Buffer;
 import java.util.*;
 import java.lang.reflect.*;
 
@@ -460,8 +463,36 @@ public class LogFile {
             synchronized(this) {
                 preAppend();
                 // some code goes here
+                rollback(tid.getId());
             }
         }
+    }
+
+    private void rollback(long tidid) throws NoSuchElementException, IOException{
+        // 整体代码可参考print(),拿到update日志后倒序执行
+        // 或者自己直接实现倒序的读取方式
+
+        // print();
+        long begin = tidToFirstLogRecord.get(tidid);
+
+        raf.seek(raf.length() - LONG_SIZE); // the last record
+        long cur = raf.readLong();
+        while (begin < cur) {// 第一条为begin,因此begin == cur情况可以直接跳过
+            raf.seek(cur);
+            int curType = raf.readInt();
+            long curTid = raf.readLong();
+            if (curType == UPDATE_RECORD && curTid == tidid) {
+                Page beforePage = readPageData(raf);
+                Database.getCatalog().getDatabaseFile(beforePage.getId().getTableId()).writePage(beforePage);
+                Database.getBufferPool().discardPage(beforePage.getId());
+            }
+            raf.seek(cur - LONG_SIZE);
+            cur = raf.readLong();
+        }
+
+        // Return the file pointer to its original position
+        raf.seek(currentOffset);
+        // print();
     }
 
     /** Shutdown the logging system, writing out whatever state
@@ -487,6 +518,74 @@ public class LogFile {
             synchronized (this) {
                 recoveryUndecided = false;
                 // some code goes here
+                /*
+                    1. cp之前的已经被强制刷盘, 从cp开始进行redo
+                    2. 记录cp之后未提交的tx为 loser tx
+                    3. 遇到cp之后abort的直接undo (redo + undo, 相当于啥也没做)
+                 */
+                currentOffset = raf.length(); // 这一步别忘了,rollback需要
+                raf.seek(0);
+                long lastCp = raf.readLong();
+                if (lastCp == NO_CHECKPOINT_ID) {
+                    lastCp = LONG_SIZE; // 没有cp点,则从第一条record开始
+                }
+                long cur = lastCp;
+
+                Set<Long> losers = new HashSet<>();
+                // 同rollback,可以采取两种方式,这里使用print()的方式去做
+                while (true) {
+                    try {
+                        raf.seek(cur);
+                        int curType = raf.readInt();
+                        long curTid = raf.readLong();
+
+                        switch (curType) {
+                            case BEGIN_RECORD:
+                                tidToFirstLogRecord.put(curTid, cur);
+                                losers.add(curTid);
+                                cur = raf.getFilePointer() + LONG_SIZE;
+                                break;
+                            case ABORT_RECORD:
+                                rollback(curTid);
+                                tidToFirstLogRecord.remove(curTid);
+                                losers.remove(curTid);
+                                cur += INT_SIZE + 2 * LONG_SIZE; // rollback会将指file pointer指向最新处,因此要特殊处理以下
+                                break;
+                            case COMMIT_RECORD:
+                                tidToFirstLogRecord.remove(curTid);
+                                losers.remove(curTid);
+                                cur = raf.getFilePointer() + LONG_SIZE;
+                                break;
+                            case UPDATE_RECORD:
+                                readPageData(raf); //before-page
+                                Page afterPage = readPageData(raf);
+                                Database.getCatalog().getDatabaseFile(afterPage.getId().getTableId()).writePage(afterPage);
+                                cur = raf.getFilePointer() + LONG_SIZE;
+                                break;
+                            case CHECKPOINT_RECORD:
+                                int numTxs = raf.readInt();
+                                while (numTxs -- != 0) {
+                                    long tid = raf.readLong();
+                                    long beginOffset = raf.readLong();
+                                    tidToFirstLogRecord.put(tid,beginOffset);
+                                    losers.add(tid);
+                                }
+                                cur = raf.getFilePointer() + LONG_SIZE;
+                                break;
+                            default:
+                                throw new IOException("Invalid record type");
+                        }
+                    } catch (EOFException e) {
+                        //e.printStackTrace();
+                        break;
+                    }
+                }
+
+                for (long tid : losers) {
+                    rollback(tid);
+                }
+                // 恢复point
+                raf.seek(raf.length());
             }
          }
     }

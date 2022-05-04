@@ -522,9 +522,24 @@ public class BufferPool {
         // some code goes here
         // not necessary for lab1|lab2
         // 实验文档要求比较简单，假设transactionComplete will not crash during commit processing，因此*不需要实现基于日志的恢复*
+        // 2022.5.3 开发lab6, 实现wal日志功能,因此假设此处会发生crash
         if (commit) {
             try {
-                flushPages(tid);
+//                flushPages(tid);
+                // 弃用flushPages,原因是lab6需要page.setBeforeImage() after flush
+                // 如果直接修改弃用flushPages是不可行的,因为不是只有提交时才会flush
+                Set<PageId> dirtyPages = lockManager.getDirtyPages(tid);
+                for (PageId pid : dirtyPages) {
+                    // if判断原因见flushpages
+                    Page page = cache.get(pid);
+                    if (page != null) {
+                        flushPage(pid);
+                        page.setBeforeImage();
+
+                    } else {
+                        System.out.println("DEBUG: the test may be improper");
+                    }
+                }
             } catch (IOException e) {
                 e.printStackTrace();
                 return;
@@ -539,7 +554,6 @@ public class BufferPool {
 //        }
         // 释放tid的所有page锁
         lockManager.releaseLock(tid);
-
     }
 
     private synchronized void restorePages(TransactionId tid) {
@@ -584,7 +598,6 @@ public class BufferPool {
         throws DbException, IOException, TransactionAbortedException {
         // some code goes here
         // not necessary for lab1
-        System.out.println("start insert");
         DbFile dbFile = Database.getCatalog().getDatabaseFile(tableId);
         List<Page> modifiedPages = dbFile.insertTuple(tid, t);
         for (Page page : modifiedPages) {
@@ -667,8 +680,14 @@ public class BufferPool {
     private synchronized  void flushPage(PageId pid) throws IOException {
         // some code goes here
         // not necessary for lab1
+
         Page page = cache.get(pid);
-        if (page.isDirty() != null) {
+        TransactionId dirtier = page.isDirty();
+        if (dirtier != null) {
+            // append an update record to the log, with a before-image and after-image.
+            Database.getLogFile().logWrite(dirtier, page.getBeforeImage(), page);
+            Database.getLogFile().force();
+
             DbFile dbFile = Database.getCatalog().getDatabaseFile(pid.getTableId());
             dbFile.writePage(page);
             page.markDirty(false, null);
@@ -692,7 +711,8 @@ public class BufferPool {
             // 代码符合一致性,只是为了过测试进行特判
             if (cache.get(pid) != null) {
                 flushPage(pid);
-
+            } else {
+                System.out.println("DEBUG: the test may be improper");
             }
         }
     }
